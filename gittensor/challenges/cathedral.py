@@ -5,10 +5,11 @@
 
 Cathedral (cathedral.computer) runs the official run itself in a fresh TDX VM that the miner has no shell in, and signs
 a receipt that binds the result, the solver, the image, the seed block, the attempt count and who submitted it. The
-format is ``cathedral_challenge_receipt_v1``. ``attestation.verify`` has already checked the signature over gittensor's
+format is ``cathedral_challenge_receipt_v1`` (a TDX quote) or ``cathedral_challenge_receipt_v1_1``, which also allows an
+AMD SEV-SNP report from Cathedral's sealed capacity and changes nothing else. ``attestation.verify`` has already checked the signature over gittensor's
 own digest with a key pinned in ``challenge.json``; ``receipt_error`` checks the rest, offline, and never runs code.
 
-Not checked here: Intel's signature chain over the TDX quote. Without it the trust level is ``platform`` (Cathedral's
+Not checked here: Intel's signature chain over the TDX quote, and AMD's (ARK, ASK, VCEK) over the SNP report. Without it the trust level is ``platform`` (Cathedral's
 signature, a quote that is well formed and bound to the receipt) and ``min_trust: hardware`` is refused.
 """
 
@@ -25,6 +26,9 @@ from gittensor.challenges.attestation import CATHEDRAL, POLARIS, Attestation, di
 from gittensor.challenges.head_to_head import canonical
 
 SCHEMA = 'cathedral_challenge_receipt_v1'
+SCHEMA_V1_1 = 'cathedral_challenge_receipt_v1_1'  # v1 plus ``tee.type: amd_sev_snp``; v1 receipts verify as before
+TDX, SNP = 'intel_tdx', 'amd_sev_snp'
+TEE_TYPES = {SCHEMA: (TDX,), SCHEMA_V1_1: (TDX, SNP)}
 TRUST_LEVELS = ('platform', 'hardware')
 PLATFORM_SIGNER = 'cathedral_platform'  # what a receipt calls its own signer, as against ``signer.kind`` outside it
 CLAIMS_DOMAIN = b'cathedral-challenge-receipt-v1/claims\0'
@@ -37,6 +41,16 @@ QUOTE_BODY = (  # the TDX v4 report body: (field, bytes), in order
     *(('xfam', 8), ('mrtd', 48), ('mrconfigid', 48), ('mrowner', 48), ('mrownerconfig', 48)),
     *(('rtmr0', 48), ('rtmr1', 48), ('rtmr2', 48), ('rtmr3', 48), ('report_data', 64)),
 )
+SNP_TEE_KEYS = {'type', 'binding', 'report_b64', 'report_sha256', 'cert_chain', 'measurement'}
+SNP_REPORT_SIZE = 1184
+SNP_REPORT = (  # the AMD SEV-SNP ATTESTATION_REPORT fields checked here: (field, offset, bytes), little-endian
+    *(('version', 0x00, 4), ('policy', 0x08, 8), ('vmpl', 0x30, 4), ('signature_algo', 0x34, 4)),
+    *(('key_info', 0x48, 4), ('report_data', 0x50, 64), ('measurement', 0x90, 48), ('reported_tcb', 0x180, 8)),
+    *(('chip_id', 0x1A0, 64), ('signature', 0x2A0, 144)),  # the signature (r, s) covers bytes 0..0x2A0
+)
+SNP_VERSIONS = (3, 4, 5)
+SNP_ECDSA_P384_SHA384 = 1
+SNP_POLICY_RESERVED_ONE, SNP_POLICY_MIGRATE_MA, SNP_POLICY_DEBUG = 1 << 17, 1 << 18, 1 << 19
 
 
 @dataclass(frozen=True)
@@ -77,6 +91,13 @@ def quote_fields(quote: bytes) -> dict[str, bytes]:
     return fields
 
 
+def snp_fields(report: bytes) -> dict[str, bytes]:
+    """The fields of an SNP attestation report. Raises ``ValueError`` when it is not one."""
+    if len(report) != SNP_REPORT_SIZE:
+        raise ValueError(f'the SNP report is {len(report)} bytes, not {SNP_REPORT_SIZE}')
+    return {name: report[offset : offset + size] for name, offset, size in SNP_REPORT}
+
+
 def image_measurement(fields: dict[str, bytes]) -> str:
     h = hashlib.sha256(IMAGE_DOMAIN)
     for name in ('td_attributes', 'xfam', 'mrtd', 'rtmr0', 'rtmr1', 'rtmr2', 'rtmr3'):
@@ -115,8 +136,8 @@ def receipt_error(att: Attestation, config, author: Author | None = None) -> str
 
 def _receipt_error(att: Attestation, config, policy: dict, author: Author | None) -> str | None:
     receipt = att.signer.get('receipt')
-    if not isinstance(receipt, dict) or receipt.get('schema') != SCHEMA:
-        return f'no {SCHEMA} in signer.receipt'
+    if not isinstance(receipt, dict) or receipt.get('schema') not in TEE_TYPES:
+        return f'no {" or ".join(TEE_TYPES)} in signer.receipt'
     if set(receipt) != TOP_KEYS or set(receipt['claims']) != CLAIM_KEYS:
         return 'the receipt has missing or unknown fields'
     if has_float(receipt):
@@ -167,13 +188,22 @@ def _receipt_error(att: Attestation, config, policy: dict, author: Author | None
         expected['repo'] = (claims['challenge']['repo'], policy['repo'])
     if wrong := [f'{name} ({got!r} is not {want!r})' for name, (got, want) in expected.items() if got != want]:
         return f'the receipt does not match the attestation or challenge.json: {", ".join(wrong)}'
-    if error := quote_error(receipt, claims, policy):
+    if error := evidence_error(receipt, claims, policy):
         return error
     if policy.get('min_trust', 'platform') != 'platform':
-        return f'min_trust {policy["min_trust"]!r} needs the Intel quote chain check, which is not built in yet'
+        chain = 'AMD VCEK chain' if receipt['tee']['type'] == SNP else 'Intel quote chain'
+        return f'min_trust {policy["min_trust"]!r} needs the {chain} check, which is not built in yet'
     if author:
         return author_error(sub, author)
     return None
+
+
+def evidence_error(receipt: dict, claims: dict, policy: dict) -> str | None:
+    """The receipt's ``tee`` is a kind its schema allows, and that evidence checks out."""
+    kind = receipt['tee'].get('type')
+    if kind not in TEE_TYPES[receipt['schema']]:
+        return f'tee.type {kind!r} is not allowed under {receipt["schema"]}'
+    return snp_error(receipt['tee'], claims, policy) if kind == SNP else quote_error(receipt, claims, policy)
 
 
 def quote_error(receipt: dict, claims: dict, policy: dict) -> str | None:
@@ -202,6 +232,40 @@ def quote_error(receipt: dict, claims: dict, policy: dict) -> str | None:
     allowed = policy.get('tdx_image_measurements') or []
     if binding == 'rd-claims-v1' and allowed and tee['image_measurement'] not in allowed:
         return f'runner measurement {tee["image_measurement"]} is not in challenge.json'
+    return None
+
+
+def snp_error(tee: dict, claims: dict, policy: dict) -> str | None:
+    """The SNP report is well formed, from a production guest (VMPL 0, debug and migration agent off, VCEK-signed),
+    carries the receipt's claims in its report data, and has a measurement challenge.json pins. Unlike the TDX
+    allowlist the pin is required: an empty ``snp_measurements`` refuses every SNP receipt."""
+    if set(tee) != SNP_TEE_KEYS or tee['binding'] != 'rd-claims-v1':
+        return 'the SNP evidence has missing or unknown fields, or a binding other than rd-claims-v1'
+    report = base64.b64decode(tee['report_b64'], validate=True)
+    if len(report) != SNP_REPORT_SIZE or hashlib.sha256(report).hexdigest() != tee['report_sha256']:
+        return 'the receipt has no SNP report, or its hash is wrong'
+    fields = snp_fields(report)
+    number = {name: int.from_bytes(fields[name], 'little') for name in ('version', 'policy', 'vmpl', 'key_info')}
+    policy_bits, key_info = number['policy'], number['key_info']
+    if number['version'] not in SNP_VERSIONS:
+        return f'SNP report version {number["version"]} is not one of {SNP_VERSIONS}'
+    if policy_bits & SNP_POLICY_DEBUG:
+        return 'the SNP guest policy allows debug'
+    if not policy_bits & SNP_POLICY_RESERVED_ONE or policy_bits & SNP_POLICY_MIGRATE_MA:
+        return 'the SNP guest policy has reserved bit 17 clear or allows a migration agent'
+    if number['vmpl'] != 0 or int.from_bytes(fields['signature_algo'], 'little') != SNP_ECDSA_P384_SHA384:
+        return 'the SNP report is not from VMPL 0 or not ECDSA P-384 with SHA-384'
+    if key_info & 0b10 or (key_info >> 2) & 0b111 != 0:  # MASK_CHIP_KEY set, or SIGNING_KEY not the VCEK (0)
+        return 'the SNP report is not signed by a VCEK'
+    if not all(any(fields[name]) for name in ('chip_id', 'measurement', 'reported_tcb', 'signature')):
+        return 'the SNP report has a zero chip id, measurement, TCB or signature'
+    commitment = hashlib.sha256(CLAIMS_DOMAIN + receipt_bytes(claims)).digest()
+    if fields['report_data'] != commitment + bytes(32):
+        return 'the SNP report does not carry these claims'
+    if fields['measurement'].hex() != tee['measurement']:
+        return 'the SNP report does not match the receipt measurement'
+    if tee['measurement'] not in (policy.get('snp_measurements') or []):
+        return f'SNP measurement {tee["measurement"]} is not in challenge.json'
     return None
 
 

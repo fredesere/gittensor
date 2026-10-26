@@ -20,6 +20,9 @@ from gittensor.challenges.cathedral import (
     CLAIMS_DOMAIN,
     QUOTE_BODY,
     QUOTE_HEADER,
+    SCHEMA_V1_1,
+    SNP_REPORT,
+    SNP_REPORT_SIZE,
     Author,
     pinned_error,
     receipt_bytes,
@@ -330,3 +333,108 @@ def test_the_maintainer_crowns_the_sample_pr_and_closes_one_opened_by_someone_el
 
     copied = judge(author='copycat', author_id=9, files=['attestation.json', 'solvers/copycat/1/solve'])
     assert (copied.decision, copied.checks[-1].name) == ('close', 'receipt')
+
+
+# -- receipt v1.1: an AMD SEV-SNP report in place of the TDX quote ---------------------------------------------------
+
+SNP_MEASUREMENT = 'ab' * 48
+SNP_POLICY = {**POLICY, 'snp_measurements': [SNP_MEASUREMENT]}
+SNP_CONFIG = replace(CONFIG, attestation=SNP_POLICY)
+SNP_OFFSETS = {name: offset for name, offset, _ in SNP_REPORT}
+
+
+def snp_report(claims: dict, **fields: int | bytes) -> bytes:
+    """A synthetic SNP report (no AMD signature over it) for a production guest, with ``fields`` overriding it."""
+    commitment = hashlib.sha256(CLAIMS_DOMAIN + receipt_bytes(claims)).digest()
+    values = {
+        'version': 5,
+        'policy': 1 << 17 | 1 << 16,  # reserved bit 17 and SMT allowed: a normal production guest
+        'vmpl': 0,
+        'signature_algo': 1,
+        'key_info': 0,
+        'report_data': commitment + bytes(32),
+        'measurement': bytes.fromhex(SNP_MEASUREMENT),
+        'reported_tcb': 0x1B00000000000004,
+        'chip_id': b'\x11' * 64,
+        'signature': b'\x22' * 144,
+        **fields,
+    }
+    report = bytearray(SNP_REPORT_SIZE)
+    for name, offset, size in SNP_REPORT:
+        value = values[name]
+        report[offset : offset + size] = value if isinstance(value, bytes) else value.to_bytes(size, 'little')
+    return bytes(report)
+
+
+def snp_sample(report: bytes | None = None, **fields) -> dict:
+    doc = sample()
+    receipt = doc['signer']['receipt']
+    raw = report if report is not None else snp_report(receipt['claims'], **fields)
+    receipt['schema'] = SCHEMA_V1_1
+    receipt['tee'] = {
+        'type': 'amd_sev_snp',
+        'binding': 'rd-claims-v1',
+        'report_b64': base64.b64encode(raw).decode(),
+        'report_sha256': hashlib.sha256(raw).hexdigest(),
+        'cert_chain': None,
+        'measurement': raw[SNP_OFFSETS['measurement'] : SNP_OFFSETS['measurement'] + 48].hex(),
+    }
+    return doc
+
+
+def test_a_v1_1_receipt_with_an_snp_report_verifies_and_v1_still_does():
+    assert receipt_error(resigned(snp_sample()), SNP_CONFIG, AUTHOR) is None
+    assert receipt_error(Attestation.from_json(json.dumps(SAMPLE)), SNP_CONFIG, AUTHOR) is None
+
+
+def test_v1_1_still_accepts_the_tdx_quote_and_v1_refuses_snp():
+    tdx = sample()
+    tdx['signer']['receipt']['schema'] = SCHEMA_V1_1
+    v1_snp = snp_sample()
+    v1_snp['signer']['receipt']['schema'] = 'cathedral_challenge_receipt_v1'
+
+    assert refusal(resigned(tdx)) == 'accepted'
+    assert 'not allowed under cathedral_challenge_receipt_v1' in refusal(resigned(v1_snp), SNP_CONFIG)
+
+
+@pytest.mark.parametrize(
+    'fields, reason',
+    [
+        ({'version': 2}, 'version 2'),
+        ({'policy': 1 << 17 | 1 << 19}, 'allows debug'),
+        ({'policy': 1 << 17 | 1 << 18}, 'migration agent'),
+        ({'policy': 0}, 'reserved bit 17'),
+        ({'vmpl': 1}, 'VMPL 0'),
+        ({'signature_algo': 2}, 'P-384'),
+        ({'key_info': 1 << 2}, 'not signed by a VCEK'),  # a VLEK
+        ({'key_info': 0b10}, 'not signed by a VCEK'),  # MASK_CHIP_KEY
+        ({'chip_id': bytes(64)}, 'zero chip id'),
+        ({'signature': bytes(144)}, 'zero chip id'),
+        ({'report_data': bytes(64)}, 'does not carry these claims'),
+        ({'measurement': b'\xcd' * 48}, 'not in challenge.json'),
+    ],
+)
+def test_an_snp_report_outside_the_production_profile_is_refused(fields, reason):
+    assert reason in refusal(resigned(snp_sample(**fields)), SNP_CONFIG)
+
+
+def test_snp_needs_a_pinned_measurement_an_exact_report_and_a_closed_tee():
+    doc = snp_sample()
+    tee = doc['signer']['receipt']['tee']
+    short = snp_sample(report=snp_report(doc['signer']['receipt']['claims'])[:-1])
+    relabeled, extra, hashed = copy.deepcopy(doc), copy.deepcopy(doc), copy.deepcopy(doc)
+    relabeled['signer']['receipt']['tee']['measurement'] = 'cd' * 48
+    extra['signer']['receipt']['tee']['quote_b64'] = tee['report_b64']
+    hashed['signer']['receipt']['tee']['report_sha256'] = '0' * 64
+
+    assert 'not in challenge.json' in refusal(resigned(doc), CONFIG)  # no snp_measurements: every SNP receipt fails
+    assert 'no SNP report' in refusal(resigned(short), SNP_CONFIG)
+    assert 'does not match the receipt measurement' in refusal(resigned(relabeled), SNP_CONFIG)
+    assert 'missing or unknown fields' in refusal(resigned(extra), SNP_CONFIG)
+    assert 'no SNP report' in refusal(resigned(hashed), SNP_CONFIG)
+
+
+def test_hardware_trust_on_snp_is_refused_until_the_amd_chain_is_checked():
+    config = replace(CONFIG, attestation={**SNP_POLICY, 'min_trust': 'hardware'})
+
+    assert 'AMD VCEK chain' in refusal(resigned(snp_sample()), config)
