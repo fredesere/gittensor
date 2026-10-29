@@ -4,12 +4,12 @@
 """``gitt challenge attest --runner cathedral``: the official run happens on Cathedral (cathedral.computer), not on the
 miner's machine, so the miner never has a shell where the result is made.
 
-The API below is PROPOSED. The endpoints ship with Cathedral's P0 and may change before then; every name here is in one
+Both routes are served at ``API_URL`` and need the miner's Cathedral key as a bearer token; every name here is in one
 place so it is easy to follow them. A run is one job: the solver and the KING go up as tarballs, Cathedral pins the
-seed block when it accepts the job, runs the pinned evaluator image with no network, and returns the finished
-``attestation.json`` with its receipt.
+seed block when it accepts the job, runs the pinned evaluator image in a sealed VM with no network, and returns the
+finished ``attestation.json`` with its receipt. Only the run's creator can read it.
 
-    POST {url}/challenge-runs          202 {run_id, status, seed_block, seed_block_hash, attempt}
+    POST {url}/challenge-runs          202 {run_id, status, seed_block, seed_block_hash, attempt, status_url}
     GET  {url}/challenge-runs/{id}     {status: queued|running|succeeded|failed|expired, seed_block, attestation, error}
 
 Cathedral counts attempts per (GitHub id, challenge, round) and writes the count into the receipt; the maintainer's

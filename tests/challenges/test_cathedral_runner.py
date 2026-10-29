@@ -3,7 +3,7 @@
 
 """``gitt challenge attest --runner cathedral`` against a fake Cathedral API: what goes up, what is waited for, and
 that an attestation is written only when it is signed by the pinned key, names this miner and this solver, and is a
-crown. The endpoints are proposed, so the fake is the only server these tests talk to."""
+crown. The tests never reach the live API (a run there is billed), so the fake is the only server they talk to."""
 
 import base64
 import io
@@ -32,7 +32,7 @@ HASH = 'ab' * 32
 
 
 class FakeSession:
-    """Cathedral's side of the proposed API: accepts a run, reports ``statuses`` in turn, then returns ``attest``. A
+    """Cathedral's side of the API: accepts a run, reports ``statuses`` in turn, then returns ``attest``. A
     status can also be an exception to raise or a ``FakeResponse`` to answer with, for a network or HTTP failure."""
 
     def __init__(self):

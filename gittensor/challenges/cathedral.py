@@ -3,14 +3,16 @@
 
 """The Cathedral receipt inside ``attestation.json`` (``signer.kind == 'cathedral'``, the receipt at ``signer.receipt``).
 
-Cathedral (cathedral.computer) runs the official run itself in a fresh TDX VM that the miner has no shell in, and signs
-a receipt that binds the result, the solver, the image, the seed block, the attempt count and who submitted it. The
-format is ``cathedral_challenge_receipt_v1`` (a TDX quote) or ``cathedral_challenge_receipt_v1_1``, which also allows an
-AMD SEV-SNP report from Cathedral's sealed capacity and changes nothing else. ``attestation.verify`` has already checked the signature over gittensor's
-own digest with a key pinned in ``challenge.json``; ``receipt_error`` checks the rest, offline, and never runs code.
+Cathedral (cathedral.computer) runs the official run itself in a sealed VM (AMD SEV-SNP or Intel TDX) that the miner
+has no shell in, and signs a receipt that binds the result, the solver, the image, the seed block, the attempt count and
+who submitted it. The format is ``cathedral_challenge_receipt_v1`` (a TDX quote) or ``cathedral_challenge_receipt_v1_1``,
+which also allows an AMD SEV-SNP report from Cathedral's sealed capacity and changes nothing else.
+``attestation.verify`` has already checked the signature over gittensor's own digest with a key pinned in
+``challenge.json``; ``receipt_error`` checks the rest, offline, and never runs code.
 
-Not checked here: Intel's signature chain over the TDX quote, and AMD's (ARK, ASK, VCEK) over the SNP report. Without it the trust level is ``platform`` (Cathedral's
-signature, a quote that is well formed and bound to the receipt) and ``min_trust: hardware`` is refused.
+Not checked here: Intel's signature chain over the TDX quote, and AMD's (ARK, ASK, VCEK) over the SNP report. Without it
+the trust level is ``platform`` (Cathedral's signature, a quote that is well formed and bound to the receipt) and
+``min_trust: hardware`` is refused.
 """
 
 from __future__ import annotations
