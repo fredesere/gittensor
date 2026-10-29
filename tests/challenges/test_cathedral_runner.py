@@ -24,7 +24,9 @@ from gittensor.challenges.checkout import ATTESTATION, CONFIG
 from gittensor.challenges.head_to_head import solver_sha
 from tests.challenges import cathedral_fake
 from tests.challenges.conftest import CHALLENGE_JSON
-from tests.challenges.test_cli import cli
+from tests.challenges.test_cli import cli, git_identity  # noqa: F401
+
+# git_identity (imported above) is autouse: these tests commit to a scratch repo, and a CI runner has no git identity.
 
 IMAGE = 'ghcr.io/o/fake@sha256:' + 'a' * 64
 WHO = {'github_login': 'alice', 'github_id': 4242, 'hotkey': '5Alice'}
